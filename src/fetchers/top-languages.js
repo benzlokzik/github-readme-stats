@@ -20,7 +20,7 @@ const fetcher = (variables, token) => {
   return request(
     {
       query: `
-      query userInfo($login: String!, $after: String) {
+      query userInfo($login: String!, $after: String, $userId: ID!) {
         user(login: $login) {
           # fetch owner, org member & collaborator repos, not forks
           repositories(ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], isFork: false, first: 100, after: $after) {
@@ -30,6 +30,19 @@ const fetcher = (variables, token) => {
             }
             nodes {
               name
+              owner {
+                login
+              }
+              # user's commits on the default branch
+              defaultBranchRef {
+                target {
+                  ... on Commit {
+                    history(author: {id: $userId}) {
+                      totalCount
+                    }
+                  }
+                }
+              }
               languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
                 edges {
                   size
@@ -49,6 +62,59 @@ const fetcher = (variables, token) => {
     {
       Authorization: `token ${token}`,
     },
+  );
+};
+
+/**
+ * User id fetcher object.
+ *
+ * @param {any} variables Fetcher variables.
+ * @param {string} token GitHub token.
+ * @returns {Promise<import("axios").AxiosResponse>} User id fetcher response.
+ */
+const userIdFetcher = (variables, token) => {
+  return request(
+    {
+      query: `
+      query userId($login: String!) {
+        user(login: $login) {
+          id
+        }
+      }
+      `,
+      variables,
+    },
+    {
+      Authorization: `token ${token}`,
+    },
+  );
+};
+
+/**
+ * Throw a CustomError if the GraphQL response has errors.
+ *
+ * @param {import("axios").AxiosResponse} res GraphQL response.
+ */
+const throwOnErrors = (res) => {
+  if (!res.data.errors) {
+    return;
+  }
+  logger.error(res.data.errors);
+  if (res.data.errors[0].type === "NOT_FOUND") {
+    throw new CustomError(
+      res.data.errors[0].message || "Could not fetch user.",
+      CustomError.USER_NOT_FOUND,
+    );
+  }
+  if (res.data.errors[0].message) {
+    throw new CustomError(
+      wrapTextMultiline(res.data.errors[0].message, 90, 1)[0],
+      res.statusText,
+    );
+  }
+  throw new CustomError(
+    "Something went wrong while trying to retrieve the language data using the GraphQL API.",
+    CustomError.GRAPHQL_ERROR,
   );
 };
 
@@ -75,32 +141,17 @@ const fetchTopLanguages = async (
     throw new MissingParamError(["username"]);
   }
 
+  const idRes = await retryer(userIdFetcher, { login: username });
+  throwOnErrors(idRes);
+  const userId = idRes.data.data?.user?.id;
+
   let repoNodes = [];
   let after = null;
 
   // fetch up to MAX_PAGES pages of 100 repos (top 1000)
   for (let page = 0; page < MAX_PAGES; page++) {
-    const res = await retryer(fetcher, { login: username, after });
-
-    if (res.data.errors) {
-      logger.error(res.data.errors);
-      if (res.data.errors[0].type === "NOT_FOUND") {
-        throw new CustomError(
-          res.data.errors[0].message || "Could not fetch user.",
-          CustomError.USER_NOT_FOUND,
-        );
-      }
-      if (res.data.errors[0].message) {
-        throw new CustomError(
-          wrapTextMultiline(res.data.errors[0].message, 90, 1)[0],
-          res.statusText,
-        );
-      }
-      throw new CustomError(
-        "Something went wrong while trying to retrieve the language data using the GraphQL API.",
-        CustomError.GRAPHQL_ERROR,
-      );
-    }
+    const res = await retryer(fetcher, { login: username, after, userId });
+    throwOnErrors(res);
 
     const { nodes, pageInfo } = res.data.data.user.repositories;
     repoNodes.push(...nodes);
@@ -109,6 +160,14 @@ const fetchTopLanguages = async (
     }
     after = pageInfo.endCursor;
   }
+
+  // skip repos owned by others (orgs, collaborations) with none of the user's commits
+  repoNodes = repoNodes.filter(
+    (node) =>
+      !node.owner ||
+      node.owner.login.toLowerCase() === username.toLowerCase() ||
+      node.defaultBranchRef?.target?.history?.totalCount > 0,
+  );
   /** @type {Record<string, boolean>} */
   let repoToHide = {};
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
