@@ -7,6 +7,8 @@ import { CustomError, MissingParamError } from "../common/error.js";
 import { wrapTextMultiline } from "../common/fmt.js";
 import { request } from "../common/http.js";
 
+const MAX_PAGES = 10;
+
 /**
  * Top languages fetcher object.
  *
@@ -18,10 +20,14 @@ const fetcher = (variables, token) => {
   return request(
     {
       query: `
-      query userInfo($login: String!) {
+      query userInfo($login: String!, $after: String) {
         user(login: $login) {
           # fetch owner, org member & collaborator repos, not forks
-          repositories(ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], isFork: false, first: 100) {
+          repositories(ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], isFork: false, first: 100, after: $after) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
             nodes {
               name
               languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
@@ -69,29 +75,40 @@ const fetchTopLanguages = async (
     throw new MissingParamError(["username"]);
   }
 
-  const res = await retryer(fetcher, { login: username });
+  let repoNodes = [];
+  let after = null;
 
-  if (res.data.errors) {
-    logger.error(res.data.errors);
-    if (res.data.errors[0].type === "NOT_FOUND") {
+  // fetch up to MAX_PAGES pages of 100 repos (top 1000)
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await retryer(fetcher, { login: username, after });
+
+    if (res.data.errors) {
+      logger.error(res.data.errors);
+      if (res.data.errors[0].type === "NOT_FOUND") {
+        throw new CustomError(
+          res.data.errors[0].message || "Could not fetch user.",
+          CustomError.USER_NOT_FOUND,
+        );
+      }
+      if (res.data.errors[0].message) {
+        throw new CustomError(
+          wrapTextMultiline(res.data.errors[0].message, 90, 1)[0],
+          res.statusText,
+        );
+      }
       throw new CustomError(
-        res.data.errors[0].message || "Could not fetch user.",
-        CustomError.USER_NOT_FOUND,
+        "Something went wrong while trying to retrieve the language data using the GraphQL API.",
+        CustomError.GRAPHQL_ERROR,
       );
     }
-    if (res.data.errors[0].message) {
-      throw new CustomError(
-        wrapTextMultiline(res.data.errors[0].message, 90, 1)[0],
-        res.statusText,
-      );
+
+    const { nodes, pageInfo } = res.data.data.user.repositories;
+    repoNodes.push(...nodes);
+    if (!pageInfo?.hasNextPage) {
+      break;
     }
-    throw new CustomError(
-      "Something went wrong while trying to retrieve the language data using the GraphQL API.",
-      CustomError.GRAPHQL_ERROR,
-    );
+    after = pageInfo.endCursor;
   }
-
-  let repoNodes = res.data.data.user.repositories.nodes;
   /** @type {Record<string, boolean>} */
   let repoToHide = {};
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
